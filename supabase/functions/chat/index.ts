@@ -58,7 +58,7 @@ Deno.serve(async (req) => {
     },
   });
 
-  const { messages, embedding } = await req.json();
+  const { messages, embedding, requestSuggestions = false } = await req.json();
 
   const { data: documents, error: matchError } = await supabase
     .rpc('match_document_sections', {
@@ -89,26 +89,98 @@ Deno.serve(async (req) => {
 
   console.log(injectedDocs);
 
-  const completionMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-    [
+  // Check if we need to generate suggestions instead of a regular chat response
+  if (requestSuggestions) {
+    // Get the last message for context
+    const lastMessage = messages[messages.length - 1];
+
+    const suggestionPrompt: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      {
+        role: 'system',
+        content: codeBlock`
+          Eres un asistente especializado en agricultura regenerativa y productos Sumagro.
+          Tu tarea es generar 3-4 preguntas recomendadas para vendedores,
+          basándote en el contexto de la conversación y en la documentación disponible.
+          Las preguntas deben ser específicas, útiles para vendedores y relacionadas con:
+          1. Características y beneficios de productos Sumagro (PSD, Fertimás, Darkmix, Explotion)
+          2. Aplicaciones para diferentes cultivos
+          3. Ventajas competitivas
+          4. Casos de éxito y testimonios
+          5. Detalles técnicos que ayuden en el proceso de venta
+
+          Estructura tu respuesta como una lista numerada JSON con este formato exacto:
+          ["¿Pregunta 1?", "¿Pregunta 2?", "¿Pregunta 3?", "¿Pregunta 4?"]
+        `,
+      },
       {
         role: 'user',
         content: codeBlock`
-        You're an AI assistant who answers questions about documents.
+          Basándote en los siguientes documentos y en el contexto de la conversación,
+          genera 3-4 preguntas recomendadas para ayudar a los vendedores a obtener información útil.
+          
+          Contexto de la conversación:
+          ${lastMessage.content}
+          
+          Documentos disponibles:
+          ${injectedDocs}
+          
+          Recuerda responder solo con el formato JSON especificado.
+        `,
+      },
+    ];
 
-        You're a chat bot, so keep your replies succinct.
+    const suggestionsResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo-0125',
+      messages: suggestionPrompt,
+      max_tokens: 256,
+      temperature: 0.7,
+    });
 
-        You're only allowed to use the documents below to answer the question.
+    // Extract and parse suggestions
+    let suggestions;
+    try {
+      suggestions = JSON.parse(suggestionsResponse.choices[0].message.content || '[]');
+    } catch (e) {
+      // If parsing fails, try to extract suggestions from the text
+      const content = suggestionsResponse.choices[0].message.content || '';
+      suggestions = content.match(/["'](.+?)["']/g)?.map(m => m.replace(/["']/g, '')) || [];
+    }
 
-        If the question isn't related to these documents, say:
-        "Sorry, I couldn't find any information on that."
+    return new Response(
+      JSON.stringify({ suggestions }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+  }
 
-        If the information isn't available in the below documents, say:
-        "Sorry, I couldn't find any information on that."
+  // Regular chat response
+  const completionMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+    [
+      {
+        role: 'system',
+        content: codeBlock`
+        Eres un asistente especializado en agricultura regenerativa y productos Sumagro.
+        Tu objetivo es ayudar a los vendedores con información precisa sobre productos,
+        aplicaciones y beneficios para diferentes cultivos.
 
-        Do not go off topic.
+        Usa un tono profesional pero amigable, y siempre busca dar detalles técnicos
+        que puedan ser útiles en el proceso de venta.
 
-        Documents:
+        Debes usar solo la información de los documentos proporcionados.
+        Si la pregunta no está relacionada con estos documentos o la información
+        no está disponible, di: "Lo siento, no tengo información sobre eso, pero puedo 
+        ayudarte con detalles sobre nuestros productos como PSD, Fertimás, Darkmix y Explotion."
+
+        Al final de cada respuesta, cuando sea apropiado, sugiere una pregunta de seguimiento
+        relacionada con el tema que podría ser útil para el vendedor.
+        `,
+      },
+      {
+        role: 'user',
+        content: codeBlock`
+        Documentos disponibles:
         ${injectedDocs}
       `,
       },
@@ -119,7 +191,7 @@ Deno.serve(async (req) => {
     model: 'gpt-3.5-turbo-0125',
     messages: completionMessages,
     max_tokens: 1024,
-    temperature: 0,
+    temperature: 0.2,
     stream: true,
   });
 
